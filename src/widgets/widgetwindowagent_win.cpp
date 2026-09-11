@@ -17,28 +17,66 @@
 namespace QWK {
 
 #if QWINDOWKIT_CONFIG(ENABLE_WINDOWS_SYSTEM_BORDERS)
-    // https://github.com/qt/qtbase/blob/e26a87f1ecc40bc8c6aa5b889fce67410a57a702/src/plugins/platforms/windows/qwindowsbackingstore.cpp#L42
-    // In QtWidgets applications, when repainting happens, QPA at the last calls
-    // QWindowsBackingStore::flush() to draw the contents of the buffer to the screen, we need to
-    // call GDI drawing the top border after that.
+    // On Windows 10 the system top border is removed together with the window frame, so it has to
+    // be drawn manually, exactly like the Qt Quick implementation does (see BorderItem in
+    // quickwindowagent_win.cpp).
+    //
+    // The previous implementation painted it with raw GDI (FillRect() on the window DC) *after*
+    // Qt had already flushed its backing store to the screen. Because that rectangle lives outside
+    // of Qt's backing store, every repaint left the border area in an inconsistent state for at
+    // least one compositor frame: Qt flushes the client content, GDI paints over the same pixels,
+    // and whichever of the two DWM happens to pick up becomes visible - which shows up as the top
+    // border blinking on every repaint.
+    //
+    // Painting the border from a child widget instead keeps it inside the very same backing store
+    // as the rest of the user interface, so it is uploaded and composited atomically with
+    // everything else and therefore can never flicker.
+    class WidgetBorderWidget : public QWidget {
+    public:
+        inline WidgetBorderWidget(QWidget *parent, Windows10BorderHandler *handler)
+            : QWidget(parent), handler(handler) {
+            // The border is pure decoration: it must never take part in hit testing, mouse
+            // handling or focus handling.
+            setAttribute(Qt::WA_TransparentForMouseEvents);
+            setAttribute(Qt::WA_NoSystemBackground);
+            setFocusPolicy(Qt::NoFocus);
+        }
 
-    // After debugging, we know that there are two situations that will lead to repaint.
-    //
-    // 1. Windows sends a WM_PAINT message, after which Qt immediately generates a QExposeEvent or
-    // QResizeEvent and send it to the corresponding QWidgetWindow instance, calling "flush" at the
-    // end of its handler.
-    //
-    // 2. When a timer or user input triggers Qt to repaint spontaneously, the corresponding
-    // QWidget receives a QEvent::UpdateRequest event and also calls "flush" at the end of its
-    // handler.
-    //
-    // The above two cases are mutually exclusive, so we just need to intercept the two events
-    // separately and draw the border area after the "flush" is called.
+        inline void syncGeometry() {
+            const int thickness = qMax(1, handler->borderThickness());
+            // Keep it pinned to the top edge of the client area, which is exactly where the DWM
+            // extended frame draws the (now removed) system border.
+            const QRect target(0, 0, parentWidget()->width(), thickness);
+            const bool targetVisible = handler->isNormalWindow();
 
-    // https://github.com/qt/qtbase/blob/e26a87f1ecc40bc8c6aa5b889fce67410a57a702/src/plugins/platforms/windows/qwindowswindow.cpp#L2440
-    // Note that we can not draw the border right after WM_PAINT comes or right before the WndProc
-    // returns, because Qt calls BeginPaint() and EndPaint() itself. We should make sure that we
-    // draw the top border between these two calls, otherwise some display exceptions may arise.
+            // Only touch the widget when the result actually changed. Re-applying an unchanged
+            // geometry / visibility would invalidate the parent's dirty opaque region and
+            // schedule a repaint the window does not need, which is perceived as the user
+            // interface refreshing late.
+            if (target == currentGeometry && targetVisible == currentVisible) {
+                return;
+            }
+            currentGeometry = target;
+            currentVisible = targetVisible;
+
+            setGeometry(target);
+            setVisible(targetVisible);
+            raise();  // Make sure it always stays above the title bar / ribbon.
+        }
+
+    protected:
+        inline void paintEvent(QPaintEvent *) override {
+            QPainter painter(this);
+            handler->drawBorderEmulated(&painter, QRect(QPoint(0, 0), size()));
+        }
+
+    private:
+        Windows10BorderHandler *handler;
+
+        // Cached state, so that syncGeometry() is a cheap no-op unless something changed.
+        QRect currentGeometry;
+        bool currentVisible = false;
+    };
 
     class WidgetBorderHandler : public QObject, public Windows10BorderHandler {
     public:
@@ -46,6 +84,7 @@ namespace QWK {
                                      QObject *parent = nullptr)
             : QObject(parent), Windows10BorderHandler(ctx), widget(widget) {
             widget->installEventFilter(this);
+            borderWidget = new WidgetBorderWidget(widget, this);
 
             // First update
             if (ctx->windowId()) {
@@ -55,98 +94,23 @@ namespace QWK {
         }
 
         void updateGeometry() override {
-            // The window top border is manually painted by QWK so we want to give
-            // some margins to avoid it covering real window contents, however, we
-            // found that there are some rounding issues for the thin border and
-            // thus this small trick doesn't work very well when the DPR is not
-            // integer. So far we haven't found a perfect solution, so just don't
-            // set any margins. In theory the window content will only be covered
-            // by 1px or so, it should not be a serious issue in the real world.
-            //
-            // widget->setContentsMargins(isNormalWindow() ? QMargins(0, borderThickness(), 0, 0)
-            //                                             : QMargins());
+            borderWidget->syncGeometry();
         }
 
         bool isWindowActive() const override {
             return widget->isActiveWindow();
         }
 
-        inline void forwardEventToWidgetAndDraw(QWidget *w, QEvent *event) {
-            // https://github.com/qt/qtbase/blob/e26a87f1ecc40bc8c6aa5b889fce67410a57a702/src/widgets/kernel/qapplication.cpp#L3286
-            // Deliver the event
-            if (!forwardObjectEventFilters(this, w, event)) {
-                // Let the widget paint first
-                std::ignore = static_cast<QObject *>(w)->event(event);
-                QCoreApplicationPrivate::setEventSpontaneous(event, false);
-            }
-
-            // Due to the timer or user action, Qt will repaint some regions spontaneously,
-            // even if there is no WM_PAINT message, we must wait for it to finish painting
-            // and then update the top border area.
-            drawBorderNative();
-        }
-
-        inline void forwardEventToWindowAndDraw(QWindow *window, QEvent *event) {
-            // https://github.com/qt/qtbase/blob/e26a87f1ecc40bc8c6aa5b889fce67410a57a702/src/widgets/kernel/qapplication.cpp#L3286
-            // Deliver the event
-            if (!forwardObjectEventFilters(ctx, window, event)) {
-                // Let Qt paint first
-                std::ignore = static_cast<QObject *>(window)->event(event);
-                QCoreApplicationPrivate::setEventSpontaneous(event, false);
-            }
-
-            // Upon receiving the WM_PAINT message, Qt will repaint the entire view, and we
-            // must wait for it to finish painting before drawing this top border area.
-            drawBorderNative();
-        }
-
     protected:
-        bool sharedEventFilter(QObject *obj, QEvent *event) override {
-            Q_UNUSED(obj)
-
-            switch (event->type()) {
-                case QEvent::Expose: {
-                    // Qt will absolutely send a QExposeEvent or QResizeEvent to the QWindow when it
-                    // receives a WM_PAINT message. When the control flow enters the expose handler,
-                    // Qt must have already called BeginPaint() and it's the best time for us to
-                    // draw the top border.
-
-                    // Since a QExposeEvent will be sent immediately after the QResizeEvent, we can
-                    // simply ignore it.
-#if (QT_VERSION >= QT_VERSION_CHECK(6, 0, 0))
-                    struct ExposeEvent : public QExposeEvent {
-                        inline const QRegion &getRegion() const { return m_region; }
-                    };
-                    auto ee = static_cast<ExposeEvent *>(event);
-                    bool exposeRegionValid = !ee->getRegion().isNull();
-#else
-                    auto ee = static_cast<QExposeEvent *>(event);
-                    bool exposeRegionValid = !ee->region().isNull();
-#endif
-                    auto window = widget->windowHandle();
-                    if (window->isExposed() && isNormalWindow() && exposeRegionValid) {
-                        forwardEventToWindowAndDraw(window, event);
-                        return true;
-                    }
-                    break;
-                }
-                default:
-                    break;
-            }
-            return Windows10BorderHandler::sharedEventFilter(obj, event);
-        }
-
+        // NOTE: sharedEventFilter() is deliberately not overridden. The base class only needs it
+        // for WinIdChange, and every geometry relevant event below is delivered to the host
+        // widget itself, so handling them in a single place avoids syncing twice per event.
         bool eventFilter(QObject *obj, QEvent *event) override {
             Q_UNUSED(obj)
 
             switch (event->type()) {
-                case QEvent::UpdateRequest: {
-                    if (!isNormalWindow())
-                        break;
-                    forwardEventToWidgetAndDraw(widget, event);
-                    return true;
-                }
-
+                case QEvent::Resize:
+                case QEvent::Show:
                 case QEvent::WindowStateChange: {
                     updateGeometry();
                     break;
@@ -154,7 +118,12 @@ namespace QWK {
 
                 case QEvent::WindowActivate:
                 case QEvent::WindowDeactivate: {
+                    // The border colour depends on the activation state of the window, and the
+                    // context moves the native extended frame on (de)activation, so the client
+                    // area right below it has to be refreshed as well. Repainting through the
+                    // backing store keeps this flicker free.
                     widget->update();
+                    borderWidget->update();
                     break;
                 }
 
@@ -164,7 +133,9 @@ namespace QWK {
             return false;
         }
 
+    private:
         QWidget *widget;
+        WidgetBorderWidget *borderWidget;
     };
 
     void WidgetWindowAgentPrivate::setupWindows10BorderWorkaround() {

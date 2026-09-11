@@ -43,8 +43,11 @@ namespace QWK {
         }
 
         inline bool isNormalWindow() const {
-            return !(ctx->window()->windowStates() &
-                     (Qt::WindowMinimized | Qt::WindowMaximized | Qt::WindowFullScreen));
+            // The window handle can still be null while the host object is being set up, so
+            // never dereference it unconditionally here.
+            const auto *win = ctx->window();
+            return win && !(win->windowStates()
+                            & (Qt::WindowMinimized | Qt::WindowMaximized | Qt::WindowFullScreen));
         }
 
         inline void drawBorderEmulated(QPainter *painter, const QRect &rect) {
