@@ -70,8 +70,28 @@ namespace QWK {
     using WndProcHash = QHash<HWND, Win32WindowContext *>;
     Q_GLOBAL_STATIC(WndProcHash, g_wndProcHash)
 
-    // Original Qt window proc function
+    // Original Qt window proc function.
+    // 仅作为"取不到按窗口记录时的兜底"。注意: 不同窗口的 GWLP_WNDPROC 并不保证相同
+    // —— Qt 平台插件会为不同窗口安装不同的过程, 第三方库也可能先于我们子类化。
+    // 实测(同一进程内): 主窗口 GWLP_WNDPROC != ADS 无边框浮动容器的 GWLP_WNDPROC,
+    // 而只有"该窗口自己的那一个"能把消息交给 Qt 平台层处理。
+    // 因此绝不能用它去代转发别的窗口的消息, 真正的转发目标见 g_originalProcHash。
     static WNDPROC g_qtWindowProc = nullptr;
+
+    // 每个窗口各自的"原始窗口过程"(被我们挂钩前的那一个)。
+    // 这里原本是一个全局单例、且只在管理第一个窗口时捕获一次, 于是其后每一个受管窗口
+    // 的消息(包括 WM_PAINT)都被转发到"第一个窗口的过程": 那个函数对当前窗口无效,
+    // Qt 平台层再也收不到该窗口的消息 —— 表现为 WM_PAINT 永不 BeginPaint, 失效区域
+    // 永不清空, win32k 无限重投 WM_PAINT 活锁(实测 ~600k 次/秒), 窗口永不 expose/绘制,
+    // GUI 线程被打满, 界面形同卡死。
+    using OriginalProcHash = QHash<HWND, WNDPROC>;
+    Q_GLOBAL_STATIC(OriginalProcHash, g_originalProcHash)
+
+    // 该窗口原始的窗口过程(hash 里没有时退回兜底值)。
+    static inline WNDPROC originalWndProcOf(HWND hWnd) {
+        const WNDPROC proc = g_originalProcHash->value(hWnd, nullptr);
+        return proc ? proc : g_qtWindowProc;
+    }
 
     static bool isLikelyFrameDriftAfterWinIdChange(HWND hwnd, const RECT &expectedFrameRect,
                                                    const RECT &candidateFrameRect) {
@@ -645,7 +665,7 @@ namespace QWK {
         // QWindow may have been destroyed before WinIdChange event comes
         auto ctx = g_wndProcHash->value(hWnd);
         if (!ctx || !ctx->window()) {
-            return ::CallWindowProcW(g_qtWindowProc, hWnd, message, wParam, lParam);
+            return ::CallWindowProcW(originalWndProcOf(hWnd), hWnd, message, wParam, lParam);
         }
 
         WindowsNativeEventFilter::lastMessageContext = ctx;
@@ -656,7 +676,7 @@ namespace QWK {
         // Since Qt does the necessary processing of the WM_NCCALCSIZE message, we need to
         // forward it right away and process it in our native event filter.
         if (message == WM_NCCALCSIZE) {
-            return ::CallWindowProcW(g_qtWindowProc, hWnd, message, wParam, lParam);
+            return ::CallWindowProcW(originalWndProcOf(hWnd), hWnd, message, wParam, lParam);
         }
 
         // Try hooked procedure and save result
@@ -671,7 +691,7 @@ namespace QWK {
         }
 
         // Continue dispatching.
-        return ::CallWindowProcW(g_qtWindowProc, hWnd, message, wParam, lParam);
+        return ::CallWindowProcW(originalWndProcOf(hWnd), hWnd, message, wParam, lParam);
     }
 
     static inline void addManagedWindow(QWindow *window, HWND hWnd, Win32WindowContext *ctx) {
@@ -684,9 +704,16 @@ namespace QWK {
             setInternalWindowFrameMargins(window, QMargins(0, -getTitleBarHeight(hWnd), 0, 0));
         }
 
-        // Store original window proc
+        // Store original window proc —— 必须"按窗口"记录, 不能全局共用一个。
+        // 这里原来是一个全局单例、只在第一个窗口时捕获一次, 于是所有受管窗口的转发目标
+        // 都变成了第一个窗口的过程; 对其它窗口而言 Qt 平台层彻底收不到消息(WM_PAINT
+        // 永不 BeginPaint => 失效区域永不清空 => win32k 无限重投 => 窗口不显示 + GUI
+        // 线程被打满)。
+        const WNDPROC prevProc =
+            reinterpret_cast<WNDPROC>(::GetWindowLongPtrW(hWnd, GWLP_WNDPROC));
+        g_originalProcHash->insert(hWnd, prevProc);
         if (!g_qtWindowProc) {
-            g_qtWindowProc = reinterpret_cast<WNDPROC>(::GetWindowLongPtrW(hWnd, GWLP_WNDPROC));
+            g_qtWindowProc = prevProc; // 仅供极端情况下兜底
         }
 
         // Hook window proc
@@ -712,14 +739,20 @@ namespace QWK {
             return;
 
         // Unhook the window procedure, but only when ours is still the one installed. Anybody
-        // is free to subclass the window after we did, and writing g_qtWindowProc back
+        // is free to subclass the window after we did, and writing the original proc back
         // unconditionally would silently drop them out of the chain. When that happens we
         // simply leave QWKHookedWndProc in place: with no context left in g_wndProcHash it
-        // forwards everything straight to g_qtWindowProc anyway.
-        if (g_qtWindowProc &&
-            reinterpret_cast<WNDPROC>(::GetWindowLongPtrW(hWnd, GWLP_WNDPROC)) ==
-                QWKHookedWndProc) {
-            ::SetWindowLongPtrW(hWnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_qtWindowProc));
+        // forwards everything straight to that window's own original proc anyway.
+        // 注意: 必须写回"该窗口自己的"原始过程, 不能用全局兜底值 —— 那会把该窗口交给另一个
+        // 窗口的窗口过程, 从此 Qt 收不到它的任何消息。
+        // 这里刻意不删除 g_originalProcHash 中的条目: 上面的"别人在我们之后子类化"场景下,
+        // QWKHookedWndProc 仍留在链上, 需要靠这条记录才能继续正确转发。
+        if (reinterpret_cast<WNDPROC>(::GetWindowLongPtrW(hWnd, GWLP_WNDPROC)) ==
+            QWKHookedWndProc) {
+            if (const WNDPROC originalProc = g_originalProcHash->value(hWnd, nullptr)) {
+                ::SetWindowLongPtrW(hWnd, GWLP_WNDPROC,
+                                    reinterpret_cast<LONG_PTR>(originalProc));
+            }
         }
 
         // Remove event filter if the all windows has been destroyed
