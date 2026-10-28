@@ -662,6 +662,14 @@ namespace QWK {
             return FALSE;
         }
 
+        // 进程退出阶段 Windows 仍可能把消息派发到这里, 而此时 Qt 的 Q_GLOBAL_STATIC
+        // 已经被析构(实测崩溃栈: exit() -> LdrShutdownProcess -> RtlProcessFlsData
+        // -> KiUserCallbackDispatcher -> QWKCore!QWKHookedWndProc -> AV c0000005)。
+        // 哈希表已释放, 绝不能再解引用, 直接交给默认窗口过程。
+        if (g_wndProcHash.isDestroyed() || g_originalProcHash.isDestroyed()) {
+            return ::DefWindowProcW(hWnd, message, wParam, lParam);
+        }
+
         // QWindow may have been destroyed before WinIdChange event comes
         auto ctx = g_wndProcHash->value(hWnd);
         if (!ctx || !ctx->window()) {
