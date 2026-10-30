@@ -8,7 +8,23 @@
 
 #include <QtCore/private/qobject_p.h>
 
+#include <atomic>
+
 namespace QWK {
+
+    namespace {
+        // 进程退出阶段标志:置位后窗口钩子不再把消息转发给 Qt 平台层。
+        // 用原子变量 + 静态生命周期,避免在退出阶段依赖任何需要构造/析构的对象。
+        std::atomic<bool> g_processShuttingDown{false};
+    } // namespace
+
+    void setProcessShuttingDown(bool value) {
+        g_processShuttingDown.store(value, std::memory_order_release);
+    }
+
+    bool isProcessShuttingDown() {
+        return g_processShuttingDown.load(std::memory_order_acquire);
+    }
 
     bool forwardObjectEventFilters(QObject *currentFilter, QObject *receiver, QEvent *event) {
         // https://github.com/qt/qtbase/blob/e26a87f1ecc40bc8c6aa5b889fce67410a57a702/src/corelib/kernel/qcoreapplication.cpp#L1244

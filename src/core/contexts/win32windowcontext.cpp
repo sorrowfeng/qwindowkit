@@ -662,10 +662,18 @@ namespace QWK {
             return FALSE;
         }
 
-        // 进程退出阶段 Windows 仍可能把消息派发到这里, 而此时 Qt 的 Q_GLOBAL_STATIC
-        // 已经被析构(实测崩溃栈: exit() -> LdrShutdownProcess -> RtlProcessFlsData
-        // -> KiUserCallbackDispatcher -> QWKCore!QWKHookedWndProc -> AV c0000005)。
-        // 哈希表已释放, 绝不能再解引用, 直接交给默认窗口过程。
+        // 进程退出阶段 Windows 仍可能把挂起的消息派发到这里: 此时 Qt 的窗口平台
+        // 上下文已经析构, 转发给 Qt 的窗口过程会解引用空指针。实测崩溃:
+        //   exit() -> LdrShutdownProcess -> RtlProcessFlsData
+        //     -> KiUserCallbackDispatcher -> QWKHookedWndProc
+        //     -> 转发给 Qt 的窗口过程 -> mov rax,[rcx] (rcx == nullptr)  AV
+        // 应用通过 qAddPostRoutine() 在 QCoreApplication 析构阶段调用
+        // QWK::setProcessShuttingDown(); 置位后一律交给默认窗口过程, 不再碰 Qt。
+        if (isProcessShuttingDown()) {
+            return ::DefWindowProcW(hWnd, message, wParam, lParam);
+        }
+
+        // 同理: Qt 的 Q_GLOBAL_STATIC 也可能已被析构, 这时不能解引用哈希表
         if (g_wndProcHash.isDestroyed() || g_originalProcHash.isDestroyed()) {
             return ::DefWindowProcW(hWnd, message, wParam, lParam);
         }

@@ -45,6 +45,17 @@ namespace QWK {
 
     using ScreenRectCallback = std::function<QRect(const QSize &)>;
 
+    // 告知 QWindowKit: 进程即将退出, 不要再把窗口消息转发给 Qt 平台层。
+    //
+    // 崩溃现场(2026-10, 上位机退出必崩):
+    //   exit() -> LdrShutdownProcess -> RtlProcessFlsData -> KiUserCallbackDispatcher
+    //     -> QWKHookedWndProc -> 转发给 Qt 的窗口过程 -> NULL 解引用 (c0000005)
+    // 原因: 进程收尾阶段 Windows 仍会把挂起的窗口消息派发进来, 但此时 Qt 的窗口
+    // 平台上下文(QWindowsContext 等)已经析构, 转发过去就是访问空指针。
+    // 应用应在 QCoreApplication 析构阶段(窗口已销毁、进程尚未真正退出)通过
+    // qAddPostRoutine() 调用本函数; 置位后钩子过程直接走 DefWindowProcW。
+    QWK_CORE_EXPORT void setProcessShuttingDown(bool value = true);
+
 }
 
 #endif // QWKGLOBAL_H

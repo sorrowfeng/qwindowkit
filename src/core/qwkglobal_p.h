@@ -68,6 +68,9 @@ namespace QWK {
     // Be careful when apply this function to a widget
     QWK_CORE_EXPORT bool forwardObjectEventFilters(QObject *currentFilter, QObject *receiver,
                                                    QEvent *event);
+
+    // 内部使用:进程是否已进入退出收尾阶段(见 qwkglobal.h 的 setProcessShuttingDown)
+    QWK_CORE_EXPORT bool isProcessShuttingDown();
 }
 
 #endif // QWKGLOBAL_P_H
